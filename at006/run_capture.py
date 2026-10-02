@@ -49,7 +49,7 @@ def main() -> None:
     entry = entries[0]
     entry_bytes = json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     (rec / "entry_canonical.json").write_bytes(entry_bytes)
-    feed_bytes = (work / "fixtures/miniflux/synthetic_local_test_feed.xml").read_bytes()
+    feed_bytes = (work / "synthetic_local_test_feed.xml").read_bytes()
     miniflux_sha = hashlib.sha256(Path("/tmp/miniflux").read_bytes()).hexdigest()
     provenance = {
         "capture_class": "RECORDED_NON_PRODUCTION_MINIFLUX_API",
