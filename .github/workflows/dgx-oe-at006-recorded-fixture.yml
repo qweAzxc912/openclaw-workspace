@@ -1,0 +1,121 @@
+name: DGX OE AT006 Recorded Fixture
+
+on:
+  push:
+    branches:
+      - at006-fixture-closure-a02b-20261002
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: miniflux_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d miniflux_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare synthetic local feed
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p fixture
+          cat > fixture/synthetic_local_test_feed.xml <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <rss version="2.0">
+            <channel>
+              <title>DGX AT006 Synthetic Local Test Feed</title>
+              <link>http://127.0.0.1:18080/</link>
+              <description>TEST_ONLY non-production synthetic source.</description>
+              <language>en-US</language>
+              <lastBuildDate>Fri, 02 Oct 2026 08:45:00 GMT</lastBuildDate>
+              <item>
+                <guid isPermaLink="false">dgx-at006-entry-001</guid>
+                <title>Synthetic disclosure for AT006 recorded Miniflux capture</title>
+                <link>http://127.0.0.1:18080/synthetic-entry-001</link>
+                <pubDate>Fri, 02 Oct 2026 08:44:00 GMT</pubDate>
+                <description><![CDATA[TEST_ONLY synthetic content. No production source or market-data binding.]]></description>
+              </item>
+            </channel>
+          </rss>
+          EOF
+          sha256sum fixture/synthetic_local_test_feed.xml | tee fixture/origin_feed.sha256
+
+      - name: Download and verify Miniflux 2.3.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --retry-delay 2             -o /tmp/miniflux             https://github.com/miniflux/v2/releases/download/2.3.3/miniflux-linux-amd64
+          echo "237bf0aed05e86c235b6bcfbad843bfc7bcdd6a628ece672eae3d1e013ddd244  /tmp/miniflux" | sha256sum -c -
+          chmod +x /tmp/miniflux
+          /tmp/miniflux -version | tee fixture/miniflux-version.txt
+
+      - name: Start local feed and real Miniflux
+        shell: bash
+        env:
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/miniflux_test?sslmode=disable
+          ADMIN_USERNAME: admin
+          ADMIN_PASSWORD: test123
+          CREATE_ADMIN: "1"
+          RUN_MIGRATIONS: "1"
+          FETCHER_ALLOW_PRIVATE_NETWORKS: "1"
+          BASE_URL: http://127.0.0.1:8080
+          LISTEN_ADDR: 127.0.0.1:8080
+          LOG_LEVEL: debug
+        run: |
+          set -euo pipefail
+          (cd fixture && python3 -m http.server 18080 --bind 127.0.0.1 > /tmp/feed-http.log 2>&1) &
+          /tmp/miniflux > /tmp/miniflux.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:8080/healthcheck >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/miniflux.log >&2 || true
+          exit 1
+
+      - name: Capture real Miniflux API bytes
+        shell: bash
+        env:
+          MINIFLUX_BASE_URL: http://127.0.0.1:8080
+          MINIFLUX_USERNAME: admin
+          MINIFLUX_PASSWORD: test123
+          AT006_FEED_URL: http://127.0.0.1:18080/synthetic_local_test_feed.xml
+        run: |
+          set -euo pipefail
+          python3 at006/run_capture.py fixture
+
+      - name: Preserve logs and hashes
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p fixture/logs
+          cp /tmp/miniflux.log fixture/logs/miniflux.log 2>/dev/null || true
+          cp /tmp/feed-http.log fixture/logs/feed-http.log 2>/dev/null || true
+          find fixture -type f -print0 | sort -z | xargs -0 sha256sum > fixture/ALL_SHA256SUMS.txt || true
+
+      - name: Upload recorded fixture evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dgx-oe-at006-recorded-miniflux-fixture
+          retention-days: 7
+          if-no-files-found: error
+          path: fixture/
