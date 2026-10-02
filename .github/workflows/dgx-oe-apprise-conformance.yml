@@ -1,0 +1,114 @@
+name: DGX OE Apprise v2 Conformance
+
+on:
+  push:
+    branches:
+      - at006-fixture-closure-a02b-20261002
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and verify Apprise v2.0.0 wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --retry-delay 2             -o /tmp/apprise-2.0.0-py3-none-any.whl             https://github.com/caronc/apprise/releases/download/v2.0.0/apprise-2.0.0-py3-none-any.whl
+          echo "945a2500a846b88b3c126a8d6e7c0472f6e3d94d8be52c836d8819f8db50b3d7  /tmp/apprise-2.0.0-py3-none-any.whl" | sha256sum -c -
+          python -m pip install /tmp/apprise-2.0.0-py3-none-any.whl
+          python - <<'PY'
+          import apprise
+          print(apprise.__version__)
+          assert apprise.__version__ == "2.0.0"
+          PY
+
+      - name: Start isolated local JSON receiver
+        shell: bash
+        run: |
+          cat > /tmp/receiver.py <<'PY'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          from pathlib import Path
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n = int(self.headers.get("Content-Length", "0"))
+                  body = self.rfile.read(n)
+                  Path("/tmp/apprise_request.bin").write_bytes(body)
+                  Path("/tmp/apprise_headers.txt").write_text(str(self.headers), encoding="utf-8")
+                  self.send_response(200)
+                  self.end_headers()
+                  self.wfile.write(b"OK")
+              def log_message(self, fmt, *args):
+                  pass
+          HTTPServer(("127.0.0.1", 18081), H).serve_forever()
+          PY
+          python /tmp/receiver.py >/tmp/receiver.log 2>&1 &
+          echo $! >/tmp/receiver.pid
+          sleep 1
+
+      - name: Execute real Apprise v2 result semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python - <<'PY'
+          import hashlib, json
+          import apprise
+          from apprise import Apprise, AppriseResultStatus
+
+          wheel = "/tmp/apprise-2.0.0-py3-none-any.whl"
+          a = Apprise()
+          assert a.add("json://127.0.0.1:18081/dgx-at006")
+          result = a.notify(title="DGX OE TEST_ONLY", body="M17 isolated conformance")
+          out = {
+              "apprise_version": apprise.__version__,
+              "wheel_sha256": hashlib.sha256(open(wheel,"rb").read()).hexdigest(),
+              "status": result.status.name,
+              "bool_result": bool(result),
+              "success_count": result.success_count,
+              "failed_count": result.failed_count,
+              "service_results": [
+                  {
+                      "name": r.name,
+                      "status": r.status.name,
+                      "privacy_url": r.url,
+                      "url_id": r.url_id,
+                      "attempt_count": len(r.attempts),
+                  }
+                  for r in result.results
+              ],
+          }
+          assert result.status == AppriseResultStatus.SUCCESS
+          assert out["status"] == "SUCCESS"
+          assert out["service_results"]
+          assert all(x["status"] == "SUCCESS" for x in out["service_results"])
+          json.dump(out, open("evidence/apprise_real_result.json","w"), indent=2, sort_keys=True)
+          result.close()
+
+          # NOMATCH must remain distinct from generic FAILURE.
+          empty = Apprise().notify(title="x", body="y")
+          nomatch = {"status": empty.status.name, "bool_result": bool(empty), "service_count": len(empty.results)}
+          assert empty.status == AppriseResultStatus.NOMATCH
+          json.dump(nomatch, open("evidence/apprise_nomatch_result.json","w"), indent=2, sort_keys=True)
+          empty.close()
+          PY
+          test -s /tmp/apprise_request.bin
+          sha256sum /tmp/apprise_request.bin > evidence/local_receiver_body.sha256
+          cp /tmp/apprise_headers.txt evidence/local_receiver_headers.txt
+          sha256sum evidence/* > evidence/SHA256SUMS.txt
+          cat evidence/apprise_real_result.json
+          cat evidence/apprise_nomatch_result.json
+
+      - name: Upload conformance evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: dgx-oe-apprise-v2-conformance
+          retention-days: 7
+          if-no-files-found: error
+          path: evidence/
